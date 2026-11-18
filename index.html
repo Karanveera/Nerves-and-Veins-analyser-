@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vein Detector</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#667085; --line:#dfe3ea; --accent:#2f6fed; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151c; --card:#1b202b; --text:#e8ebf2; --muted:#98a2b3; --line:#2c3342; --accent:#6c99ff; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); background:var(--card); }
+  header h1 { margin:0; font-size:20px; }
+  main { max-width:1100px; margin:20px auto; padding:0 16px; }
+  .settings { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; background:var(--card);
+              border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:16px; }
+  label { font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }
+  input[type=text], select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px;
+              background:var(--bg); color:var(--text); font-size:14px; }
+  .views { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
+  .card h2 { font-size:14px; margin:0 0 8px; color:var(--muted); font-weight:600; }
+  .frame { background:#000; border-radius:8px; min-height:240px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  .frame img, .frame video { max-width:100%; max-height:520px; display:block; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0; align-items:center; }
+  button { padding:10px 18px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text);
+           font-size:14px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:disabled { opacity:.5; cursor:wait; }
+  #status { font-size:13px; color:var(--muted); }
+  #status.err { color:#d92d20; }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; }
+</style>
+</head>
+<body>
+<header><h1>Vein Detector</h1></header>
+<main>
+
+  <!-- ====== EDIT THESE TWO LINES ====== -->
+  <script>
+    const CAMERA_IP = "192.168.1.50";                  // your camera's local IP
+    const API_URL   = "https://YOUR-API.onrender.com"; // your hosted Python API address
+  </script>
+  <!-- ================================== -->
+
+  <div class="settings">
+    <div><label>Camera source</label>
+      <select id="source"><option value="ip">IP camera (local network)</option><option value="webcam">Laptop webcam</option></select></div>
+    <div><label>Camera IP</label><input type="text" id="ip"></div>
+    <div><label>Stream path / Capture path</label>
+      <div style="display:flex;gap:6px"><input type="text" id="streamPath" value=":81/stream"><input type="text" id="capPath" value="/capture"></div></div>
+    <div><label>Hosted API address</label><input type="text" id="api"></div>
+    <div><label>Sensitivity: <span id="sensVal">0.8</span></label><input type="range" id="sens" min="0" max="1" step="0.05" value="0.8" style="width:100%"></div>
+    <div><label>Where are the fingers?</label>
+      <select id="hand"><option>auto</option><option>top</option><option>bottom</option><option>left</option><option>right</option><option>none</option></select></div>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="capture">📸 Capture &amp; detect veins</button>
+    <button id="restart">↻ Restart live view</button>
+    <label style="margin:0">or <input type="file" id="upload" accept="image/*"></label>
+    <span id="status">Ready.</span>
+  </div>
+
+  <div class="views">
+    <div class="card"><h2>Live view</h2>
+      <div class="frame"><img id="liveImg" alt="live stream" crossorigin="anonymous" style="display:none"><video id="liveVid" autoplay playsinline muted style="display:none"></video></div>
+      <div class="hint">If nothing shows, check the IP and that this computer is on the camera's Wi-Fi.</div></div>
+    <div class="card"><h2>Captured photo</h2><div class="frame"><img id="shot" alt="" style="display:none"></div></div>
+    <div class="card"><h2>Predicted veins: <span id="count">–</span></h2>
+      <div class="frame"><img id="result" alt="" style="display:none"></div>
+      <div class="row" style="margin-bottom:0"><button id="download" disabled>Download marked image</button></div></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+};
+$("ip").value  = store.get("ip", CAMERA_IP);
+$("api").value = store.get("api", API_URL);
+$("sens").oninput = () => $("sensVal").textContent = $("sens").value;
+["ip", "api"].forEach(k => $(k).onchange = () => { store.set(k, $(k).value.trim()); startLive(); });
+
+let webcamStream = null;
+const base = () => "http://" + $("ip").value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
+// ":81/stream" is appended to the host; "/capture" goes on the host
+const hostOnly = () => base();
+const streamUrl  = () => hostOnly() + $("streamPath").value.trim();
+const captureUrl = () => hostOnly() + $("capPath").value.trim();
+
+function setStatus(msg, err = false) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+async function startLive() {
+  if (webcamStream) { webcamStream.getTracks().forEach(t => t.stop()); webcamStream = null; }
+  const img = $("liveImg"), vid = $("liveVid");
+  if ($("source").value === "webcam") {
+    try {
+      webcamStream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
+      vid.srcObject = webcamStream; vid.style.display = "block"; img.style.display = "none";
+      setStatus("Webcam live.");
+    } catch (e) { setStatus("Webcam blocked: " + e.message, true); }
+  } else {
+    vid.style.display = "none"; img.style.display = "block";
+    img.src = streamUrl() + (streamUrl().includes("?") ? "&" : "?") + "t=" + Date.now();  // cache-buster
+    img.onerror = () => setStatus("Cannot reach the camera stream at " + streamUrl(), true);
+    img.onload = () => setStatus("Live.");
+  }
+}
+
+// Get one photo as a Blob from the current source
+async function grabFrame() {
+  if ($("source").value === "webcam") {
+    const v = $("liveVid"), c = document.createElement("canvas");
+    c.width = v.videoWidth; c.height = v.videoHeight; c.getContext("2d").drawImage(v, 0, 0);
+    return await new Promise(r => c.toBlob(r, "image/jpeg", 0.92));
+  }
+  // 1) full-quality still from /capture (needs the camera to allow CORS)
+  try {
+    const r = await fetch(captureUrl() + "?t=" + Date.now());
+    if (r.ok) return await r.blob();
+  } catch (e) { /* fall through */ }
+  // 2) copy the frame currently showing in the live stream
+  const img = $("liveImg"), c = document.createElement("canvas");
+  c.width = img.naturalWidth; c.height = img.naturalHeight;
+  c.getContext("2d").drawImage(img, 0, 0);
+  return await new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error("blocked")), "image/jpeg", 0.92));
+}
+
+async function predict(blob) {
+  $("shot").src = URL.createObjectURL(blob); $("shot").style.display = "block";
+  setStatus("Predicting… (the first request can take ~30 s if the server was asleep)");
+  const fd = new FormData();
+  fd.append("file", blob, "photo.jpg");
+  fd.append("sensitivity", $("sens").value);
+  fd.append("hand", $("hand").value);
+  const r = await fetch($("api").value.trim().replace(/\/$/, "") + "/predict", { method: "POST", body: fd });
+  if (!r.ok) throw new Error("Server said " + r.status + ": " + (await r.text()).slice(0, 120));
+  const j = await r.json();
+  $("result").src = j.image; $("result").style.display = "block";
+  $("count").textContent = j.count;
+  $("download").disabled = false;
+  setStatus("Done – " + j.count + " veins marked.");
+}
+
+async function run(getBlob) {
+  $("capture").disabled = true;
+  try { await predict(await getBlob()); }
+  catch (e) {
+    const cors = /blocked|tainted|Failed to fetch|NetworkError/i.test(e.message);
+    setStatus(cors ? "Browser blocked reading the camera image (camera has no CORS). Use the file picker, or the laptop webcam option. Details: " + e.message
+                   : "Error: " + e.message, true);
+  }
+  $("capture").disabled = false;
+}
+
+$("capture").onclick = () => run(grabFrame);
+$("upload").onchange = e => { if (e.target.files[0]) run(async () => e.target.files[0]); };
+$("restart").onclick = startLive;
+$("source").onchange = startLive;
+$("download").onclick = () => { const a = document.createElement("a"); a.href = $("result").src; a.download = "veins_marked.png"; a.click(); };
+startLive();
+</script>
+</body>
+</html>

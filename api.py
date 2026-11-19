@@ -30,6 +30,10 @@ async def predict(file: UploadFile = File(...), sensitivity: float = Form(0.8),
     if img is None:
         raise HTTPException(400, "Not a valid image")
     hand = None if hand == "none" else hand
-    _, marked, n = process(img, sensitivity, min_length, hand=hand, max_veins=max_veins)
-    ok, buf = cv2.imencode(".png", marked)
-    return {"count": int(n), "image": "data:image/png;base64," + base64.b64encode(buf).decode()}
+    clear, marked, n = process(img, sensitivity, min_length, hand=hand, max_veins=max_veins,
+                               return_enhanced=True)
+    ok, buf = cv2.imencode(".png", marked)       # cleaned-up picture with the veins drawn on it
+    ok2, buf2 = cv2.imencode(".jpg", clear, [cv2.IMWRITE_JPEG_QUALITY, 92])   # the cleaned picture alone
+    return {"count": int(n),
+            "image": "data:image/png;base64," + base64.b64encode(buf).decode(),
+            "enhanced": "data:image/jpeg;base64," + base64.b64encode(buf2).decode()}

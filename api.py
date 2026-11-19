@@ -21,7 +21,8 @@ def health():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...), sensitivity: float = Form(0.8),
-                  hand: str = Form("auto"), min_length: int = Form(45)):
+                  hand: str = Form("auto"), min_length: int = Form(30),
+                  max_veins: int = Form(12)):
     data = await file.read()
     if len(data) > 10_000_000:
         raise HTTPException(413, "Image too large (max 10 MB)")
@@ -29,6 +30,6 @@ async def predict(file: UploadFile = File(...), sensitivity: float = Form(0.8),
     if img is None:
         raise HTTPException(400, "Not a valid image")
     hand = None if hand == "none" else hand
-    _, marked, n = process(img, sensitivity, min_length, hand=hand)
+    _, marked, n = process(img, sensitivity, min_length, hand=hand, max_veins=max_veins)
     ok, buf = cv2.imencode(".png", marked)
     return {"count": int(n), "image": "data:image/png;base64," + base64.b64encode(buf).decode()}

@@ -11,19 +11,43 @@ PALETTE = [  # BGR colours, one per detected vein
 ]
 
 
-def _skin_mask(bgr):
-    """Foreground (skin) mask so background / edges aren't detected as veins."""
-    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-    m = cv2.inRange(ycrcb, (40, 133, 70), (255, 185, 140))
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    m &= (gray > 35).astype(np.uint8) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
-    # keep largest blob
+def _largest_blob(m):
     n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
     if n > 1:
         m = (lab == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])).astype(np.uint8) * 255
+    return m
+
+
+def _clean(m, ks=9):
+    m = cv2.medianBlur(m, 9)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+    return _largest_blob(m)
+
+
+def _skin_mask(bgr):
+    """Foreground (skin) mask so background / edges aren't detected as veins.
+    Works for light AND dark skin and for dim, colour-cast camera images."""
+    h, w = bgr.shape[:2]
+    ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    Cr = ycc[:, :, 1]
+    # 1) hue/saturation + Cr based (handles dark skin and warm or green camera casts)
+    m = ((Cr >= 129) & ((H <= 32) | (H >= 170)) & (S >= 15) & (V >= 40)).astype(np.uint8) * 255
+    m = _clean(m)
+    if (m > 0).mean() >= 0.04:
+        return m
+    # 2) classic YCrCb range
+    m = cv2.inRange(ycc, (40, 133, 70), (255, 185, 140))
+    m &= (cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) > 35).astype(np.uint8) * 255
+    m = _clean(m, 7)
+    if (m > 0).mean() >= 0.04:
+        return m
+    # 3) give up on colour: use the central part of the picture
+    m = np.zeros((h, w), np.uint8)
+    m[int(0.08 * h):int(0.92 * h), int(0.08 * w):int(0.92 * w)] = 255
     return m
 
 
@@ -179,18 +203,24 @@ def detect_veins(bgr, sensitivity=0.8, min_length=35, scale=1.0, ignore=None, ha
 
     # Veins appear darker/bluer-green than skin -> use green channel + CLAHE
     g = bgr[:, :, 1]
-    g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(g)
-    g = cv2.GaussianBlur(g, (0, 0), 1.0)
+    # stretch the contrast of the skin area only (dim / low-contrast cameras)
+    sv = g[skin > 0]
+    if sv.size > 100:
+        lo_, hi_ = np.percentile(sv, (2, 98))
+        g = np.clip((g.astype(np.float32) - lo_) * 255.0 / max(hi_ - lo_, 1), 0, 255).astype(np.uint8)
+    g = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8)).apply(g)
+    g = cv2.GaussianBlur(g, (0, 0), 1.2)
     # remove broad shading (muscle form) -> keep thin structures
-    bg = cv2.GaussianBlur(g, (0, 0), 6 * scale)
+    bg = cv2.GaussianBlur(g, (0, 0), 7 * scale)
     detail = cv2.subtract(bg, g).astype(np.float32)  # dark ridges positive
     detail = np.clip(detail, 0, None)
 
-    sigmas = [s * scale for s in (1.2, 1.6, 2.0, 2.5)]
+    sigmas = [s * scale for s in (1.5, 2.0, 2.5, 3.0, 4.0)]
     v = frangi(detail, sigmas=sigmas, black_ridges=False, beta=0.5, gamma=None)
 
     # keep only inside eroded skin (avoid silhouette edge)
-    inner = cv2.erode(skin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+    er = int(np.clip(0.07 * np.sqrt((skin > 0).sum()), 9, 33)) | 1   # smaller skin area -> smaller margin
+    inner = cv2.erode(skin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (er, er)))
     mgn = 10
     inner[:mgn, :] = 0; inner[-mgn:, :] = 0; inner[:, :mgn] = 0; inner[:, -mgn:] = 0  # ignore picture border
     if hand == "auto":
@@ -257,12 +287,37 @@ def draw_veins(bgr, skel, thickness=2, label_veins=True):
     return out, len(regions)
 
 
-def process(bgr, sensitivity=0.8, min_length=35, thickness=2, label_veins=True, ignore=None, hand=None, hand_frac=0.28):
-    # work at a consistent resolution for stable results
+def _keep_longest(skel, max_veins):
+    """Keep only the `max_veins` longest veins (long, continuous lines are the real ones)."""
+    if not max_veins:
+        return skel
+    lab = label(skel, connectivity=2)
+    regs = sorted(regionprops(lab), key=lambda r: -r.area)[:max_veins]
+    out = np.zeros_like(skel, dtype=bool)
+    for r in regs:
+        out[lab == r.label] = True
+    return out
+
+
+def process(bgr, sensitivity=0.8, min_length=35, thickness=2, label_veins=True, ignore=None,
+            hand=None, hand_frac=0.28, max_veins=12):
+    # work at a consistent resolution for stable results (also enlarge tiny camera frames)
     h, w = bgr.shape[:2]
     s = 800 / max(h, w)
-    small = cv2.resize(bgr, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else bgr.copy()
-    skel, _ = detect_veins(small, sensitivity, min_length, ignore=ignore, hand=hand, hand_frac=hand_frac)
+    if s < 1:
+        small = cv2.resize(bgr, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    elif s > 1.15:
+        small = cv2.resize(bgr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+    else:
+        small = bgr.copy()
+
+    skel = None
+    # try the requested settings first; if nothing is found, relax them step by step
+    for sens, ml in ((sensitivity, min_length), (1.0, min_length * 0.7), (1.0, min_length * 0.45)):
+        skel, _ = detect_veins(small, sens, max(12, int(ml)), ignore=ignore, hand=hand, hand_frac=hand_frac)
+        if skel.any():
+            break
+    skel = _keep_longest(skel, max_veins)
     marked, n = draw_veins(small, skel, thickness, label_veins)
     return small, marked, n
 
